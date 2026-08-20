@@ -94,6 +94,11 @@ class SessionManager:
         
         session_data = {
             'session_id': session_id,
+            # display_name is the human-facing label for this session. It
+            # starts as None and gets set to a short summary of the user's
+            # first question (see set_display_name). Internally we always
+            # keep using session_id as the real key/identifier.
+            'display_name': None,
             'created_at': datetime.now().isoformat(),
             'updated_at': datetime.now().isoformat(),
             'uploaded_files': [],
@@ -143,6 +148,23 @@ class SessionManager:
         if session:
             return session.get('messages', [])
         return []
+    
+    def set_display_name(self, session_id: str, display_name: str):
+        """Set the human-facing display name (summary title) for a session"""
+        if session_id in self.sessions_metadata:
+            self.sessions_metadata[session_id]['display_name'] = display_name
+            self._save_sessions_metadata()
+    
+    def get_display_name(self, session_id: str) -> str:
+        """
+        Get the label to show the user for this session: the summary title
+        if one has been generated yet, otherwise a friendly placeholder.
+        The raw session_id is never shown to the user.
+        """
+        session = self.get_session(session_id)
+        if session and session.get('display_name'):
+            return session['display_name']
+        return "New chat"
     
     def delete_session(self, session_id: str):
         """Delete a session and all its data"""

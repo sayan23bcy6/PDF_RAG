@@ -1,171 +1,219 @@
+import sys
+from unittest.mock import MagicMock
+
+sys.modules.setdefault('onnxruntime', MagicMock())
+
 import os
+import time
+import requests
 from typing import List
-from langchain_groq import ChatGroq
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_chroma import Chroma
+
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_community.vectorstores import FAISS
+from langchain_core.embeddings import Embeddings
 from langchain_core.documents import Document
+from langchain_core.messages import HumanMessage, AIMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.runnables import RunnablePassthrough, RunnableLambda
-from langchain_community.chat_message_histories import ChatMessageHistory
-from langchain_core.chat_history import BaseChatMessageHistory
+from langchain_core.runnables import RunnableLambda
+
 from session_manager import SessionManager
 from utils import setup_logger
 
 logger = setup_logger(__name__)
 
+_EMBED_URL = "https://generativelanguage.googleapis.com/v1beta/{model}:embedContent"
+
+
+# ── Pure-REST embeddings (zero gRPC, zero os._exit crashes) ───────────────────
+class GeminiRESTEmbeddings(Embeddings):
+    def __init__(self, api_key: str, model: str = "models/gemini-embedding-001"):
+        self.api_key = api_key
+        self.model = model
+        self._session = requests.Session()
+
+    def _embed(self, text: str, task_type: str) -> List[float]:
+        url = _EMBED_URL.format(model=self.model)
+        for attempt in range(1, 4):
+            try:
+                r = self._session.post(
+                    url,
+                    json={"model": self.model,
+                          "content": {"parts": [{"text": text}]},
+                          "taskType": task_type},
+                    params={"key": self.api_key},
+                    timeout=30,
+                )
+                r.raise_for_status()
+                return r.json()["embedding"]["values"]
+            except Exception as e:
+                logger.warning(f"Embed attempt {attempt}/3 failed: {e}")
+                if attempt == 3:
+                    raise RuntimeError(f"Embedding failed after 3 attempts: {e}") from e
+                time.sleep(2 ** attempt)
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        result = []
+        for i, t in enumerate(texts):
+            logger.info(f"  Embedding {i+1}/{len(texts)}...")
+            result.append(self._embed(t, "RETRIEVAL_DOCUMENT"))
+        return result
+
+    def embed_query(self, text: str) -> List[float]:
+        return self._embed(text, "RETRIEVAL_QUERY")
+
+
+# ── Simple in-memory chat history ─────────────────────────────────────────────
+class ChatHistory:
+    def __init__(self):
+        self.messages = []
+
+    def add_user(self, text: str):
+        self.messages.append(HumanMessage(content=text))
+
+    def add_ai(self, text: str):
+        self.messages.append(AIMessage(content=text))
+
+
+# ── Main RAG chain ─────────────────────────────────────────────────────────────
 class RAGChain:
     def __init__(self):
-        self.groq_api_key = os.getenv('GROQ_API_KEY')
-        self.model_name = os.getenv('MODEL_NAME', 'mixtral-8x7b-32768')
-        self.embedding_model = os.getenv('EMBEDDING_MODEL', 'all-MiniLM-L6-v2')
+        self.api_key = os.getenv("GEMINI_API_KEY")
+        if not self.api_key:
+            raise ValueError("GEMINI_API_KEY not set")
+
         self.session_manager = SessionManager()
-        
-        if not self.groq_api_key:
-            raise ValueError("GROQ_API_KEY not found in environment variables")
-        
-        self.llm = ChatGroq(
-            groq_api_key=self.groq_api_key,
-            model_name=self.model_name,
-            temperature=0.3
+
+        self.llm = ChatGoogleGenerativeAI(
+            model=os.getenv("GEMINI_CHAT_MODEL", "gemini-3.6-flash"),
+            google_api_key=self.api_key,
+            temperature=0.3,
         )
-        
-        self.embeddings = HuggingFaceEmbeddings(model_name=self.embedding_model)
-        
+
+        self.embeddings = GeminiRESTEmbeddings(
+            api_key=self.api_key,
+            model=os.getenv("GEMINI_EMBEDDING_MODEL", "models/gemini-embedding-001"),
+        )
+
         self.vectorstore = None
         self.retriever = None
         self.rag_chain = None
-        self.conversation_history = {}
-    
+        self._histories: dict[str, ChatHistory] = {}
+
+    # ── Vector store helpers ───────────────────────────────────────────────────
+    def _faiss_path(self, session_id: str) -> str:
+        base = self.session_manager.get_session_vector_store_path(session_id)
+        os.makedirs(base, exist_ok=True)
+        return base
+
+    def _load_or_create_faiss(self, session_id: str, documents: List[Document] | None = None):
+        path = self._faiss_path(session_id)
+        index_file = os.path.join(path, "index.faiss")
+
+        if os.path.exists(index_file):
+            logger.info(f"Loading existing FAISS index for session {session_id}")
+            vs = FAISS.load_local(path, self.embeddings, allow_dangerous_deserialization=True)
+            if documents:
+                logger.info(f"Appending {len(documents)} new chunks to existing index")
+                vs.add_documents(documents)
+                vs.save_local(path)
+        elif documents:
+            logger.info(f"Creating new FAISS index with {len(documents)} chunks")
+            vs = FAISS.from_documents(documents, self.embeddings)
+            vs.save_local(path)
+        else:
+            raise ValueError(f"No FAISS index found and no documents provided for session {session_id}")
+
+        return vs
+
+    # ── Public API ─────────────────────────────────────────────────────────────
     def build(self, documents: List[Document], session_id: str):
         if not documents:
-            raise ValueError("No documents provided to build RAG chain")
-        
-        vector_store_path = self.session_manager.get_session_vector_store_path(session_id)
-        
-        self.vectorstore = Chroma.from_documents(
-            documents=documents,
-            embedding=self.embeddings,
-            persist_directory=vector_store_path,
-            collection_metadata={"hnsw:space": "cosine"}
-        )
-        
-        self.vectorstore.persist()
-        
-        self.retriever = self.vectorstore.as_retriever(
-            search_type="similarity",
-            search_kwargs={"k": 5}
-        )
-        
-        self._create_rag_chain()
-        
-        logger.info(f"Built RAG chain with {len(documents)} documents for session {session_id}")
-    
+            raise ValueError("No documents provided")
+
+        # Safety truncation — Gemini embedding limit is ~2048 tokens
+        for doc in documents:
+            if len(doc.page_content) > 6000:
+                doc.page_content = doc.page_content[:6000]
+
+        logger.info(f"Building FAISS index for session {session_id} ({len(documents)} chunks)...")
+        self.vectorstore = self._load_or_create_faiss(session_id, documents)
+        self.retriever = self.vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 5})
+        self._build_chain()
+        logger.info(f"RAG chain ready for session {session_id}")
+
     def load(self, session_id: str):
-        vector_store_path = self.session_manager.get_session_vector_store_path(session_id)
-        
-        if not vector_store_path or not os.path.exists(vector_store_path):
-            raise ValueError(f"Vector store not found for session {session_id}")
-        
-        self.vectorstore = Chroma(
-            persist_directory=vector_store_path,
-            embedding_function=self.embeddings,
-            collection_metadata={"hnsw:space": "cosine"}
-        )
-        
-        self.retriever = self.vectorstore.as_retriever(
-            search_type="similarity",
-            search_kwargs={"k": 5}
-        )
-        
-        self._create_rag_chain()
-        
+        path = self._faiss_path(session_id)
+        if not os.path.exists(os.path.join(path, "index.faiss")):
+            raise ValueError(f"No FAISS index found for session {session_id}")
+        self.vectorstore = self._load_or_create_faiss(session_id)
+        self.retriever = self.vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 5})
+        self._build_chain()
         logger.info(f"Loaded RAG chain for session {session_id}")
-    
-    def _create_rag_chain(self):
-        system_prompt = (
-            "You are a professional assistant for answering questions about documents. "
-            "Use the following pieces of retrieved context to answer the question. "
-            "If you don't know the answer based on the provided context, clearly state that the information is not available in the documents. "
-            "Provide accurate, concise, and helpful answers using no more than three sentences when possible. "
-            "Always reference the source document when relevant."
-        )
-        
+
+    def _build_chain(self):
         prompt = ChatPromptTemplate.from_messages([
-            ("system", system_prompt),
+            ("system",
+             "You are a professional assistant for answering questions about uploaded documents.\n\n"
+             "Use the following retrieved context to answer the user's question.\n\n"
+             "Retrieved context:\n{context}\n\n"
+             "If the answer is not in the context, say so — do not make things up.\n"
+             "Cite source document and page number when relevant."),
             MessagesPlaceholder("chat_history"),
             ("human", "{input}"),
         ])
-        
-        def format_docs(docs):
-            return "\n\n".join(doc.page_content for doc in docs)
-        
+
+        def fmt(docs):
+            return "\n\n".join(
+                f"Source: {d.metadata.get('source','?')}\n"
+                f"Page: {d.metadata.get('page','?')}\n"
+                f"Content: {d.page_content}"
+                for d in docs
+            )
+
         self.rag_chain = (
             {
-                "context": self.retriever | RunnableLambda(format_docs),
-                "chat_history": RunnablePassthrough(),
-                "input": RunnablePassthrough(),
+                "context": (lambda x: x["input"]) | self.retriever | RunnableLambda(fmt),
+                "chat_history": lambda x: x["chat_history"],
+                "input": lambda x: x["input"],
             }
             | prompt
             | self.llm
         )
-    
-    def _get_session_history(self, session_id: str) -> BaseChatMessageHistory:
-        if session_id not in self.conversation_history:
-            self.conversation_history[session_id] = ChatMessageHistory()
-        
-        stored_messages = self.session_manager.get_session_messages(session_id)
-        
-        if len(self.conversation_history[session_id].messages) == 0 and stored_messages:
-            from langchain_core.messages import HumanMessage, AIMessage
-            
-            for msg in stored_messages:
-                if msg['role'] == 'user':
-                    self.conversation_history[session_id].add_user_message(msg['content'])
-                elif msg['role'] == 'assistant':
-                    self.conversation_history[session_id].add_ai_message(msg['content'])
-        
-        return self.conversation_history[session_id]
-    
+
     def invoke(self, user_input: str, session_id: str) -> str:
         if not self.rag_chain:
-            raise ValueError("RAG chain not built. Please build it first.")
-        
-        session_history = self._get_session_history(session_id)
-        
+            raise ValueError("RAG chain not built yet")
+
+        hist = self._get_history(session_id)
         try:
-            from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
-            
-            chat_history = session_history.messages
-            
-            response = self.rag_chain.invoke({
-                "chat_history": chat_history,
-                "input": user_input,
-            })
-            
-            # Extract text from response
-            if hasattr(response, 'content'):
-                answer = response.content
-            else:
-                answer = str(response)
-            
+            resp = self.rag_chain.invoke({"chat_history": hist.messages, "input": user_input})
+            answer = resp.content if hasattr(resp, "content") else str(resp)
+            hist.add_user(user_input)
+            hist.add_ai(answer)
             return answer
-            
         except Exception as e:
-            logger.error(f"Error invoking RAG chain: {str(e)}")
-            return f"Error generating response: {str(e)}"
-    
-    def get_retrieval_sources(self, query: str, session_id: str) -> List[dict]:
-        if not self.retriever:
-            raise ValueError("Retriever not initialized")
-        
-        docs = self.retriever.invoke(query)
-        
-        sources = []
-        for doc in docs:
-            sources.append({
-                'source': doc.metadata.get('source', 'Unknown'),
-                'page': doc.metadata.get('page', 'N/A'),
-                'content': doc.page_content[:200] + '...' if len(doc.page_content) > 200 else doc.page_content
-            })
-        
-        return sources
+            logger.error(f"invoke error: {e}")
+            return f"Error: {e}"
+
+    def generate_title(self, question: str) -> str:
+        fallback = (question.strip()[:47] + "...") if len(question.strip()) > 50 else question.strip()
+        try:
+            resp = self.llm.invoke(
+                f"Summarize this question in 6 words or fewer, no quotes or period:\n\n{question}"
+            )
+            title = resp.content.strip().split("\n")[0].strip().strip('"\'')
+            return title[:60] or fallback
+        except Exception as e:
+            logger.error(f"Title generation failed: {e}")
+            return fallback
+
+    def _get_history(self, session_id: str) -> ChatHistory:
+        if session_id not in self._histories:
+            h = ChatHistory()
+            for msg in self.session_manager.get_session_messages(session_id):
+                if msg["role"] == "user":
+                    h.add_user(msg["content"])
+                elif msg["role"] == "assistant":
+                    h.add_ai(msg["content"])
+            self._histories[session_id] = h
+        return self._histories[session_id]

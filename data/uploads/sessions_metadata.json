@@ -1,0 +1,32 @@
+{
+  "938a8661-584": {
+    "session_id": "938a8661-584",
+    "display_name": "what is my cgpa?",
+    "created_at": "2026-08-20T11:58:57.802637",
+    "updated_at": "2026-08-20T11:59:48.847761",
+    "uploaded_files": [
+      "DS_resume.pdf"
+    ],
+    "messages": [
+      {
+        "role": "user",
+        "content": "what is my cgpa?",
+        "timestamp": "2026-08-20T11:59:48.840892"
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "Based on your resume, your CGPA is **7.54** (B.Tech in Computer Science and Engineering). \n\n*(Source: DS_resume.pdf, Page 0)*",
+            "extras": {
+              "signature": "EuwECukEARFNMg+dyC6okaBzNxQg1ugbrvRDA3sFGkn7v0b9CwtTRIKZ+f7n5Ti0FKYad/Pcnu6x0iwxz4XvmUdG29vKNhsr4MN+dM8ucWpfhAewZhM0wfs25LputH9Sw5Fz3PfRG4lP//Eaezqe8ACdkU/UtRCiIoduNm8L3Tf0MFjMOo1IbV9Fu1ESPdnDjSy7HPuEXRQxO7pTiQIqdXNAVgXRca1B+WPIG2tF79loP0b4eEKerkkT7RpAWFc0rbO/PtSvhQ7uudTGrbP7u8HnqE8IJKvWISMIBbDuB9iIOgsyXgtfLd45nbDzMA+oB+bzFOTZjw7CrCjEcL4lGurRGTxRqICSN1x91K3OfCNJzDOSjv36D3F8cBCdm7xTNJu08Qvm+HSp1sRVOiYEChQA70sb67ZQV6EZ/S8k+vA64oM9S5CplghE/JWzJnXCiSAgJ/IOuj/l5dgNKdG93ru0mG6aZC2Vja06zkFEo1v46Z3lZglieD9Tsu+6WNXJW0gTcvroXHnboatelNwrMNOssecfDQ6/eDqt7Cdu7VpcHmzUw8fHquoDPrGpptLMdaRn2XapWBcIunAsV4/mooxx4Fgj1fH4vxVh3IIo/LD20Dxev9d3KywO/Efb5eNa92MCUt+9U+Ki2LbcNbV8usnL3mwANLM2bGmu5OaK2vvkCwT/AxKODw1Fnpu2+2PHdhRfFZ90UDZN3TM2UucWuOCn5HR6zY/Q1tSbL3R4YPLboJRus4wtFi0IGDeJVEmAlBdDHinuFS/yRfzdQOzkvZPFc7/YUqlvs9hQtGz78xVYhVLqh9wZf4T8ODtGP8o="
+            }
+          }
+        ],
+        "timestamp": "2026-08-20T11:59:48.847761"
+      }
+    ],
+    "vector_store_path": "data\\uploads\\938a8661-584\\vector_store"
+  }
+}
